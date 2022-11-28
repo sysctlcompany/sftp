@@ -3,8 +3,8 @@ package sftp
 import (
 	"errors"
 	"io"
+	"log"
 	"os"
-        "log"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -109,7 +109,7 @@ func (f *CheckedFile) WriteAt(b []byte, off int64) (n int, err error) {
 		}
 		return 0, os.ErrInvalid
 	}
-	return f.file.Write(b)
+	return f.file.WriteAt(b, off)
 }
 
 func (f *CheckedFile) WriterAtReaderAt(b []byte, off int64) (n int, err error) {
@@ -121,7 +121,7 @@ func (f *CheckedFile) WriterAtReaderAt(b []byte, off int64) (n int, err error) {
 		}
 		return 0, os.ErrInvalid
 	}
-	return f.file.Write(b)
+	return f.file.WriteAt(b, off)
 }
 
 func (f *CheckedFile) ReadAt(b []byte, off int64) (n int, err error) {
