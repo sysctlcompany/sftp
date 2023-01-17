@@ -105,16 +105,13 @@ func TestChrootStat(t *testing.T) {
 		assert.True(t, f.Mode().IsRegular())
 	}
 
-	// outer path will be converted relate to root, and /{root}/outbound is not exist
+	// outer path will be converted relative to root, and /{root}/outbound does not exist
 	_, err = client.Lstat(outbound)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 
-	// but we allow server to use symlink point to an outer file
-	f, err = client.Stat(outlink)
-	if assert.NoError(t, err) {
-		assert.EqualValues(t, outlink, f.Name())
-		assert.True(t, f.Mode().IsRegular())
-	}
+	// also, make sure the Stat on the link (which tries to resolve and stat the target) does not work
+	_, err = client.Stat(outlink)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestChrootLstat(t *testing.T) {
