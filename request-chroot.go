@@ -360,13 +360,13 @@ func (fs *chroot) Filelist(r *Request) (ListerAt, error) {
 		return listerat{file}, nil
 
 	case "Readlink":
-		symlink, err := os.Readlink(realPath)
+		target, err := os.Readlink(realPath)
 		if err != nil {
 			return nil, err
 		}
-		res, err := fs.getRelativePath(symlink)
+		res, err := fs.getRelativePath(target)
 		if err != nil {
-			return nil, err
+			return nil, os.ErrNotExist
 		}
 		// SFTP-v2: The server will respond with a SSH_FXP_NAME packet containing only
 		// one name and a dummy attributes value.
