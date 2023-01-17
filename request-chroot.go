@@ -62,6 +62,12 @@ func (fs *chroot) getRealPath(p string) (string, error) {
 	if err != nil || strings.HasPrefix(rel, outPathPrefix) {
 		return "", os.ErrInvalid
 	}
+
+	if strings.HasPrefix(filepath.Clean(p), fs.rootPath) == false {
+		log.Printf("getRealPath for file %s outside of chroot %s", p, fs.rootPath)
+		return "", os.ErrInvalid
+	}
+
 	return p, nil
 }
 
@@ -331,6 +337,22 @@ func (fs *chroot) Filelist(r *Request) (ListerAt, error) {
 		return res, nil
 
 	case "Stat":
+		f, err := os.Lstat(realPath)
+		if err != nil {
+			return nil, err
+		}
+		if f.Mode()&os.ModeSymlink == os.ModeSymlink {
+			target, err := os.Readlink(realPath)
+			if err != nil {
+				return nil, os.ErrNotExist
+			}
+			_, err = fs.getRelativePath(target)
+			if err != nil {
+				return nil, os.ErrNotExist
+			}
+			realPath = target
+		}
+
 		file, err := os.Stat(realPath)
 		if err != nil {
 			return nil, err
