@@ -96,7 +96,7 @@ func TestChrootStat(t *testing.T) {
 		assert.True(t, f.Mode().IsRegular())
 	}
 
-	// stat a symlink file
+	// stat a symlinked file
 	f, err = client.Stat(symlink)
 	if assert.NoError(t, err) {
 		assert.EqualValues(t, symlink, f.Name())
@@ -170,7 +170,7 @@ func TestChrootReadLink(t *testing.T) {
 		assert.Equal(t, regular, f)
 	}
 
-	// we don't want client user escape the root
+	// we don't want client user to be able to escape the root
 	_, err = client.ReadLink(outbound)
 	assert.Error(t, err)
 
