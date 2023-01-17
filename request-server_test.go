@@ -803,9 +803,9 @@ func TestRequestStatVFS(t *testing.T) {
 
 	_, ok := p.cli.HasExtension("statvfs@openssh.com")
 	require.True(t, ok, "request server doesn't list statvfs extension")
-	vfs, err := p.cli.StatVFS("/")
+	vfs, err := p.cli.StatVFS("/etc")
 	require.NoError(t, err)
-	expected, err := getStatVFSForPath("/")
+	expected, err := getStatVFSForPath("/etc")
 	require.NoError(t, err)
 	require.NotEqual(t, 0, expected.ID)
 	// check some stats
