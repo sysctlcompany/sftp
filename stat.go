@@ -3,7 +3,7 @@ package sftp
 import (
 	"os"
 
-	sshfx "github.com/pkg/sftp/internal/encoding/ssh/filexfer"
+	sshfx "github.com/sysctlcompany/sftp/internal/encoding/ssh/filexfer"
 )
 
 // isRegular returns true if the mode describes a regular file.
