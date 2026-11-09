@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -94,6 +95,7 @@ func (w ClientWrapper) Close(t *testing.T) {
 	// Err may only be read after Serve() has returned.
 	assert.ErrorIs(t, <-w.served, io.EOF)
 	assert.NoError(t, w.chroot.Err)
+	assert.NoError(t, w.chroot.Close())
 	assert.NoError(t, os.RemoveAll(w.testRoot))
 }
 
@@ -103,12 +105,14 @@ func TestChrootStat(t *testing.T) {
 	const (
 		regular = "regular"
 		symlink = "symlink"
+		abslink = "abslink"
 		outlink = "outlink"
 	)
 	// prepare, create file and symlink for stat
 	content := []byte(strings.Repeat("hello sftp", 1024))
 	require.NoError(t, ioutil.WriteFile(filepath.Join(rootPath, regular), content, 0644))
-	require.NoError(t, os.Symlink(filepath.Join(rootPath, regular), filepath.Join(rootPath, symlink)))
+	require.NoError(t, os.Symlink(regular, filepath.Join(rootPath, symlink)))
+	require.NoError(t, os.Symlink(filepath.Join(rootPath, regular), filepath.Join(rootPath, abslink)))
 	require.NoError(t, os.Symlink(filepath.Join(rootPath, outbound), filepath.Join(rootPath, outlink)))
 
 	// stat a regular file
@@ -134,6 +138,11 @@ func TestChrootStat(t *testing.T) {
 
 	// also, make sure the Stat on the link (which tries to resolve and stat the target) does not work
 	_, err = client.Stat(outlink)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	// os.Root does not follow absolute links, even ones pointing inside the root
+	// (earlier versions of the handler created those)
+	_, err = client.Stat(abslink)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
@@ -456,6 +465,7 @@ func closeExpectingTransferError(t *testing.T, w ClientWrapper) error {
 	assert.NoError(t, w.server.Close())
 	assert.NoError(t, w.Client.Close())
 	<-w.served
+	assert.NoError(t, w.chroot.Close())
 	assert.NoError(t, os.RemoveAll(w.testRoot))
 	return w.chroot.Err
 }
@@ -504,12 +514,10 @@ func TestChrootUncleanRootPath(t *testing.T) {
 			}
 			assert.FileExists(t, filepath.Join(rootPath, "file"))
 
-			// links the client creates must resolve to files inside the root,
-			// which a relative rootPath would break: the target is resolved from the link's directory
 			require.NoError(t, client.Symlink("/file", "/link"))
 			target, err := os.Readlink(filepath.Join(rootPath, "link"))
 			if assert.NoError(t, err) {
-				assert.True(t, filepath.IsAbs(target), "link target %q should be absolute", target)
+				assert.Equal(t, "file", target)
 			}
 			fi, err := client.Stat("/link")
 			if assert.NoError(t, err) {
@@ -627,8 +635,184 @@ func TestChrootFailedWriteIsTransferError(t *testing.T) {
 	defer file.Close()
 
 	fs := &chroot{freeSpace: func() uint64 { return 2 << 30 }}
-	f := &CheckedFile{file: file, fs: fs}
+	f := &CheckedFile{file: file, fs: fs, name: "/upload"}
 	_, err = f.WriteAt([]byte("data"), 0)
-	require.Error(t, err)
-	assert.Equal(t, err, fs.Err)
+	assert.ErrorIs(t, err, syscall.ENOSPC)
+	assert.ErrorIs(t, fs.Err, syscall.ENOSPC)
+
+	// the client sees its own path, not the host path
+	assert.Contains(t, err.Error(), "/upload")
+	assert.NotContains(t, err.Error(), "/dev/full")
+}
+
+// Symlinks placed in the root by something other than the client must not lead out of it,
+// whichever operation goes through them.
+func TestChrootOutwardSymlinks(t *testing.T) {
+	rootPath, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	outside := filepath.Join(filepath.Dir(rootPath), "outside")
+	require.NoError(t, os.MkdirAll(outside, 0755))
+	secret := filepath.Join(outside, "secret")
+	require.NoError(t, ioutil.WriteFile(secret, []byte("secret"), 0644))
+
+	require.NoError(t, os.Symlink(secret, filepath.Join(rootPath, "abslink")))
+	require.NoError(t, os.Symlink("../outside/secret", filepath.Join(rootPath, "rellink")))
+	require.NoError(t, os.Symlink(outside, filepath.Join(rootPath, "dirlink")))
+	// a chain: the first link stays inside, the second one leaves
+	require.NoError(t, os.Symlink("rellink", filepath.Join(rootPath, "chain")))
+
+	for _, p := range []string{"/abslink", "/rellink", "/dirlink/secret", "/chain"} {
+		_, err := client.Open(p)
+		assert.ErrorIs(t, err, os.ErrNotExist, "Open(%s)", p)
+		_, err = client.Stat(p)
+		assert.ErrorIs(t, err, os.ErrNotExist, "Stat(%s)", p)
+	}
+	_, err := client.Lstat("/dirlink/secret")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = client.ReadDir("/dirlink")
+	assert.Error(t, err)
+	_, err = client.StatVFS("/dirlink")
+	assert.Error(t, err)
+	for _, p := range []string{"/abslink", "/rellink"} {
+		_, err = client.ReadLink(p)
+		assert.Error(t, err, "ReadLink(%s)", p)
+	}
+
+	// nothing may be created, moved, or removed outside
+	_, err = client.Create("/dirlink/planted")
+	assert.Error(t, err)
+	assert.Error(t, client.Mkdir("/dirlink/planted-dir"))
+	assert.Error(t, client.Symlink("/abslink", "/dirlink/planted-link"))
+	assert.Error(t, client.Link("/dirlink/secret", "/hardlink"))
+	assert.Error(t, client.Rename("/dirlink/secret", "/stolen"))
+	assert.Error(t, client.PosixRename("/dirlink/secret", "/stolen"))
+	assert.Error(t, client.Remove("/dirlink/secret"))
+
+	entries, err := os.ReadDir(outside)
+	require.NoError(t, err)
+	if assert.Len(t, entries, 1) {
+		assert.Equal(t, "secret", entries[0].Name())
+	}
+	assert.NoFileExists(t, filepath.Join(rootPath, "hardlink"))
+	assert.NoFileExists(t, filepath.Join(rootPath, "stolen"))
+}
+
+func TestChrootSymlinkTargets(t *testing.T) {
+	rootPath, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	require.NoError(t, os.MkdirAll(filepath.Join(rootPath, "path", "sub"), 0755))
+	require.NoError(t, ioutil.WriteFile(filepath.Join(rootPath, "path", "regular"), []byte("data"), 0644))
+
+	for _, tc := range []struct {
+		target, link string
+		stored       string // on disk, relative to the link
+		resolved     string // what ReadLink reports
+	}{
+		{"/path/regular", "/path/abs", "regular", "/path/regular"},
+		{"regular", "/path/rel", "regular", "/path/regular"},
+		{"../regular", "/path/sub/up", "../regular", "/path/regular"},
+		{"/path/regular", "/top", "path/regular", "/path/regular"},
+		{"/", "/path/root", "..", "/"},
+	} {
+		require.NoError(t, client.Symlink(tc.target, tc.link), "Symlink(%s, %s)", tc.target, tc.link)
+		stored, err := os.Readlink(filepath.Join(rootPath, filepath.FromSlash(tc.link)))
+		if assert.NoError(t, err) {
+			assert.Equal(t, tc.stored, stored, tc.link)
+		}
+		got, err := client.ReadLink(tc.link)
+		if assert.NoError(t, err) {
+			assert.Equal(t, tc.resolved, got, tc.link)
+		}
+		_, err = client.Stat(tc.link)
+		assert.NoError(t, err, "Stat(%s)", tc.link)
+	}
+
+	// relative targets are resolved from the link's directory and may not climb out of the root
+	for _, tc := range []struct{ target, link string }{
+		{"..", "/up"},
+		{"../../regular", "/path/esc"},
+		{"", "/empty"},
+	} {
+		assert.Error(t, client.Symlink(tc.target, tc.link), "Symlink(%q, %s)", tc.target, tc.link)
+		_, err := os.Lstat(filepath.Join(rootPath, filepath.FromSlash(tc.link)))
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	}
+}
+
+func TestChrootStatVFS(t *testing.T) {
+	rootPath, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	vfs, err := client.StatVFS("/")
+	require.NoError(t, err)
+	expected, err := getStatVFSForPath(rootPath)
+	require.NoError(t, err)
+	assert.Equal(t, expected.Fsid, vfs.Fsid)
+	assert.Equal(t, expected.Bsize, vfs.Bsize)
+
+	_, err = client.StatVFS("/missing")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// The request server closes files through io.Closer; without it every transfer leaked a descriptor.
+func TestChrootClosesFiles(t *testing.T) {
+	if _, err := os.ReadDir("/proc/self/fd"); err != nil {
+		t.Skip("cannot count open files:", err)
+	}
+	countFDs := func() int {
+		fds, err := os.ReadDir("/proc/self/fd")
+		require.NoError(t, err)
+		return len(fds)
+	}
+
+	_, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	before := countFDs()
+	for i := 0; i < 20; i++ {
+		name := fmt.Sprintf("/file%d", i)
+		f, err := client.Create(name)
+		require.NoError(t, err)
+		_, err = f.Write([]byte("data"))
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+
+		f, err = client.Open(name)
+		require.NoError(t, err)
+		_, err = io.ReadAll(f)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+	}
+	assert.LessOrEqual(t, countFDs(), before+2)
+}
+
+func TestChrootRootUnavailable(t *testing.T) {
+	_, client := getChrootTupleWith(t, func(root string) string { return filepath.Join(root, "missing") }, nil)
+	defer client.Close(t)
+
+	_, err := client.ReadDir("/")
+	assert.ErrorContains(t, err, "root directory unavailable")
+	assert.NotContains(t, err.Error(), "missing")
+	_, err = client.Create("/file")
+	assert.ErrorContains(t, err, "root directory unavailable")
+}
+
+func TestChrootErrorsHideHostPath(t *testing.T) {
+	rootPath, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	require.NoError(t, client.Mkdir("/dir"))
+	errs := []error{client.Mkdir("/dir")}
+	_, err := client.Open("/missing")
+	errs = append(errs, err)
+	_, err = client.Lstat("/missing")
+	errs = append(errs, err)
+	errs = append(errs, client.Rename("/missing", "/other"))
+	for _, err := range errs {
+		if assert.Error(t, err) {
+			assert.NotContains(t, err.Error(), rootPath)
+		}
+	}
 }
