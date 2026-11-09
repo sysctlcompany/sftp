@@ -6,30 +6,67 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
+	"sync"
 	"syscall"
 )
 
 func ChrootHandler(rootPath string) (*chroot, Handlers) {
+	if rootPath != "" {
+		if abs, err := filepath.Abs(rootPath); err == nil {
+			rootPath = abs
+		} else {
+			rootPath = filepath.Clean(rootPath)
+		}
+	}
 	chroot := &chroot{
 		rootPath: rootPath,
 	}
 	return chroot, Handlers{chroot, chroot, chroot, chroot}
 }
 
-// err is the TransferError interface that decides if Serve() should return an error
 type chroot struct {
 	rootPath string
-	Err      error
+
+	freeSpace func() uint64
+
+	mu sync.Mutex
+	// Err holds the first error that broke a transfer in this session:
+	// out of disk space, a failed write, or the connection dropping with a file still open.
+	// The request server's workers set it concurrently;
+	// read it only after Serve() has returned.
+	Err error
 }
 
+// TransferError records err as the session's transfer error unless one is already recorded.
+// The request server calls it through CheckedFile when the connection drops with a file open.
 func (fs *chroot) TransferError(err error) {
-	fs.Err = err
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.Err == nil {
+		fs.Err = err
+	}
+}
+
+func (fs *chroot) available() uint64 {
+	if fs.freeSpace != nil {
+		return fs.freeSpace()
+	}
+	return NewDiskUsage(fs.rootPath).Available()
+}
+
+// diskFull logs and records an aborted write, once per session.
+func (fs *chroot) diskFull(name string, err error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if fs.Err == nil {
+		log.Printf("aborting write of %v, disk almost full", name)
+		fs.Err = err
+	}
 }
 
 func (fs *chroot) toOSFlags(flags uint32) (int, error) {
 	var osFlags int
-	if flags&sshFxfRead != 0 || flags&sshFxfWrite != 0 {
+	if flags&sshFxfRead != 0 && flags&sshFxfWrite != 0 {
 		osFlags |= os.O_RDWR
 	} else if flags&sshFxfWrite != 0 {
 		osFlags |= os.O_WRONLY
@@ -51,23 +88,16 @@ func (fs *chroot) toOSFlags(flags uint32) (int, error) {
 	return osFlags, nil
 }
 
-const outPathPrefix = ".." + string(filepath.Separator)
-
 func (fs *chroot) getRealPath(p string) (string, error) {
 	p = filepath.Join(fs.rootPath, p)
 	if fs.rootPath == "" || fs.rootPath == "/" {
 		return p, nil
 	}
 	rel, err := filepath.Rel(fs.rootPath, p)
-	if err != nil || strings.HasPrefix(rel, outPathPrefix) {
-		return "", os.ErrInvalid
-	}
-
-	if strings.HasPrefix(filepath.Clean(p), fs.rootPath) == false {
+	if err != nil || !filepath.IsLocal(rel) {
 		log.Printf("getRealPath for file %s outside of chroot %s", p, fs.rootPath)
 		return "", os.ErrInvalid
 	}
-
 	return p, nil
 }
 
@@ -76,7 +106,7 @@ func (fs *chroot) getRelativePath(p string) (string, error) {
 		return cleanPath(p), nil
 	}
 	rel, err := filepath.Rel(fs.rootPath, p)
-	if err != nil || strings.HasPrefix(rel, outPathPrefix) {
+	if err != nil || !filepath.IsLocal(rel) {
 		return "", os.ErrInvalid
 	}
 	return cleanPath(rel), nil
@@ -94,40 +124,46 @@ type CheckedFile struct {
 	fs   *chroot
 }
 
-func (f *CheckedFile) Write(b []byte) (n int, err error) {
-	du := NewDiskUsage(f.fs.rootPath)
-	if uint64(len(b)) > du.Available() {
-		if f.fs.Err == nil {
-			log.Printf("aborting write of %v, disk almost full", f.file.Name())
-			f.fs.TransferError(errors.New("Out of disk space, aborting write"))
-		}
-		return 0, os.ErrInvalid
+// checkSpace refuses a write of n bytes that would not fit on the disk.
+func (f *CheckedFile) checkSpace(n int) error {
+	if uint64(n) > f.fs.available() {
+		f.fs.diskFull(f.file.Name(), errors.New("Out of disk space, aborting write"))
+		return syscall.ENOSPC
 	}
-	return f.file.Write(b)
+	return nil
+}
+
+// TransferError lets the request server report transfers that broke off,
+// such as the connection dropping while the file is open.
+// CheckedFile is what the server holds, so it never calls chroot.TransferError directly.
+func (f *CheckedFile) TransferError(err error) {
+	f.fs.TransferError(err)
+}
+
+func (f *CheckedFile) Write(b []byte) (n int, err error) {
+	if err := f.checkSpace(len(b)); err != nil {
+		return 0, err
+	}
+	n, err = f.file.Write(b)
+	if err != nil {
+		f.fs.TransferError(err)
+	}
+	return n, err
 }
 
 func (f *CheckedFile) WriteAt(b []byte, off int64) (n int, err error) {
-	du := NewDiskUsage(f.fs.rootPath)
-	if uint64(len(b)) > du.Available() {
-		if f.fs.Err == nil {
-			log.Printf("aborting write of %v, disk almost full", f.file.Name())
-			f.fs.TransferError(errors.New("Out of disk space, aborting write"))
-		}
-		return 0, os.ErrInvalid
+	if err := f.checkSpace(len(b)); err != nil {
+		return 0, err
 	}
-	return f.file.WriteAt(b, off)
+	n, err = f.file.WriteAt(b, off)
+	if err != nil {
+		f.fs.TransferError(err)
+	}
+	return n, err
 }
 
 func (f *CheckedFile) WriterAtReaderAt(b []byte, off int64) (n int, err error) {
-	du := NewDiskUsage(f.fs.rootPath)
-	if uint64(len(b)) > du.Available() {
-		if f.fs.Err == nil {
-			log.Printf("aborting write of %v, disk almost full", f.file.Name())
-			f.fs.TransferError(errors.New("Out of disk space, aborting write"))
-		}
-		return 0, os.ErrInvalid
-	}
-	return f.file.WriteAt(b, off)
+	return f.WriteAt(b, off)
 }
 
 func (f *CheckedFile) ReadAt(b []byte, off int64) (n int, err error) {
@@ -135,22 +171,19 @@ func (f *CheckedFile) ReadAt(b []byte, off int64) (n int, err error) {
 }
 
 func (fs *chroot) Filewrite(r *Request) (io.WriterAt, error) {
-	du := NewDiskUsage(fs.rootPath)
-	if du.Available() < (1024 * 1024 * 1024) {
-		if fs.Err == nil {
-			log.Printf("aborting write of %v, disk almost full", r.Filepath)
-			fs.TransferError(errors.New("Out of disk space, aborting write of " + r.Filepath))
-		}
-		return nil, os.ErrInvalid
-	}
 	if r.Flags&sshFxfWrite == 0 {
 		return nil, os.ErrInvalid
 	}
 	return fs.OpenFile(r)
 }
 
+// OpenFile serves read-write opens directly; the request server sends only write-only opens through Filewrite.
 func (fs *chroot) OpenFile(r *Request) (WriterAtReaderAt, error) {
 	_ = r.WithContext(r.Context()) // initialize context for deadlock testing
+	if r.Flags&sshFxfWrite != 0 && fs.available() < (1024*1024*1024) {
+		fs.diskFull(r.Filepath, errors.New("Out of disk space, aborting write of "+r.Filepath))
+		return nil, syscall.ENOSPC
+	}
 	return fs.openfile(r.Filepath, r.Flags)
 }
 

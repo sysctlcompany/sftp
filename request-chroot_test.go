@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,13 @@ import (
 const outbound = "../outbound"
 
 func getChrootTuple(t *testing.T) (string, ClientWrapper) {
+	return getChrootTupleWith(t, nil, nil)
+}
+
+// getChrootTupleWith starts a chroot request server on <tmp>/sftp.
+// rootArg, if set, turns that path into the string passed to ChrootHandler,
+// and setup, if set, adjusts the handler before the server starts.
+func getChrootTupleWith(t *testing.T, rootArg func(sftpRoot string) string, setup func(*chroot)) (string, ClientWrapper) {
 	testRoot, err := ioutil.TempDir(os.TempDir(), "sftp")
 	require.NoError(t, err)
 	sftpRoot := filepath.Join(testRoot, "sftp")
@@ -31,15 +40,21 @@ func getChrootTuple(t *testing.T) (string, ClientWrapper) {
 	cr, sw := io.Pipe()
 	sr, cw := io.Pipe()
 
-	chroot, handlers := ChrootHandler(sftpRoot)
+	arg := sftpRoot
+	if rootArg != nil {
+		arg = rootArg(sftpRoot)
+	}
+	chroot, handlers := ChrootHandler(arg)
+	if setup != nil {
+		setup(chroot)
+	}
 	server := NewRequestServer(struct {
 		io.Reader
 		io.WriteCloser
 	}{sr, sw}, handlers)
+	served := make(chan error, 1)
 	go func() {
-		err := server.Serve()
-		assert.ErrorIs(t, err, io.EOF)
-		assert.NoError(t, chroot.Err)
+		served <- server.Serve()
 	}()
 	// NewClientPipe() will hung up until server.Serve(),
 	// make sure start server first
@@ -48,6 +63,8 @@ func getChrootTuple(t *testing.T) (string, ClientWrapper) {
 	return sftpRoot, ClientWrapper{
 		Client:   client,
 		server:   server,
+		chroot:   chroot,
+		served:   served,
 		testRoot: testRoot,
 	}
 }
@@ -65,12 +82,18 @@ func AssertNoDirExist(t *testing.T, absPath string) bool {
 type ClientWrapper struct {
 	*Client
 	server   *RequestServer
+	chroot   *chroot
+	served   chan error
 	testRoot string
 }
 
+// Close shuts the session down and checks that it ended cleanly, with no transfer error.
 func (w ClientWrapper) Close(t *testing.T) {
 	assert.NoError(t, w.server.Close())
 	assert.NoError(t, w.Client.Close())
+	// Err may only be read after Serve() has returned.
+	assert.ErrorIs(t, <-w.served, io.EOF)
+	assert.NoError(t, w.chroot.Err)
 	assert.NoError(t, os.RemoveAll(w.testRoot))
 }
 
@@ -425,4 +448,187 @@ func TestChrootReadDir(t *testing.T) {
 		res[stat.Name()] = int(stat.Size())
 	}
 	assert.EqualValues(t, files, res)
+}
+
+// closeExpectingTransferError shuts the session down like ClientWrapper.Close,
+// but returns the session's transfer error instead of requiring it to be nil.
+func closeExpectingTransferError(t *testing.T, w ClientWrapper) error {
+	assert.NoError(t, w.server.Close())
+	assert.NoError(t, w.Client.Close())
+	<-w.served
+	assert.NoError(t, os.RemoveAll(w.testRoot))
+	return w.chroot.Err
+}
+
+func TestChrootSymlinkToParent(t *testing.T) {
+	rootPath, client := getChrootTuple(t)
+	defer client.Close(t)
+
+	// The request server passes the symlink target through uncleaned,
+	// so ".." reaches the handler as the parent of the root.
+	// A link to it would expose everything next to the root.
+	assert.Error(t, client.Symlink("..", "/up"))
+	_, err := os.Lstat(filepath.Join(rootPath, "up"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
+
+	// A link to the root's parent placed on disk must not be followed or revealed either.
+	require.NoError(t, os.Symlink(filepath.Dir(rootPath), filepath.Join(rootPath, "parentlink")))
+	_, err = client.ReadLink("/parentlink")
+	assert.Error(t, err)
+	_, err = client.Stat("/parentlink")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestChrootUncleanRootPath(t *testing.T) {
+	for name, rootArg := range map[string]func(t *testing.T, root string) string{
+		"trailing slash": func(t *testing.T, root string) string { return root + "/" },
+		"dot component":  func(t *testing.T, root string) string { return root + "/./" },
+		"relative": func(t *testing.T, root string) string {
+			t.Chdir(filepath.Dir(root))
+			return "./" + filepath.Base(root)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			rootPath, client := getChrootTupleWith(t, func(root string) string { return rootArg(t, root) }, nil)
+			defer client.Close(t)
+
+			// the root itself must be listable
+			_, err := client.ReadDir("/")
+			assert.NoError(t, err)
+
+			f, err := client.Create("/file")
+			if assert.NoError(t, err) {
+				_, err = f.Write([]byte("data"))
+				assert.NoError(t, err)
+				assert.NoError(t, f.Close())
+			}
+			assert.FileExists(t, filepath.Join(rootPath, "file"))
+
+			// links the client creates must resolve to files inside the root,
+			// which a relative rootPath would break: the target is resolved from the link's directory
+			require.NoError(t, client.Symlink("/file", "/link"))
+			target, err := os.Readlink(filepath.Join(rootPath, "link"))
+			if assert.NoError(t, err) {
+				assert.True(t, filepath.IsAbs(target), "link target %q should be absolute", target)
+			}
+			fi, err := client.Stat("/link")
+			if assert.NoError(t, err) {
+				assert.EqualValues(t, 4, fi.Size())
+			}
+			got, err := client.ReadLink("/link")
+			if assert.NoError(t, err) {
+				assert.Equal(t, "/file", got)
+			}
+		})
+	}
+}
+
+func TestChrootToOSFlags(t *testing.T) {
+	fs := &chroot{}
+	for _, tc := range []struct {
+		name  string
+		flags uint32
+		want  int
+	}{
+		// a read-only open must not ask for write access,
+		// or files the server user can't write become unreadable
+		{"read", sshFxfRead, os.O_RDONLY},
+		{"write", sshFxfWrite, os.O_WRONLY},
+		{"read write", sshFxfRead | sshFxfWrite, os.O_RDWR},
+		{"write create trunc", sshFxfWrite | sshFxfCreat | sshFxfTrunc, os.O_WRONLY | os.O_CREATE | os.O_TRUNC},
+		{"write create excl", sshFxfWrite | sshFxfCreat | sshFxfExcl, os.O_WRONLY | os.O_CREATE | os.O_EXCL},
+	} {
+		got, err := fs.toOSFlags(tc.flags)
+		if assert.NoError(t, err, tc.name) {
+			assert.Equal(t, tc.want, got, tc.name)
+		}
+	}
+	_, err := fs.toOSFlags(sshFxfCreat)
+	assert.Error(t, err)
+}
+
+func TestChrootTransferErrorOnDisconnect(t *testing.T) {
+	_, client := getChrootTuple(t)
+
+	f, err := client.Create("/upload")
+	require.NoError(t, err)
+	_, err = f.Write([]byte("partial"))
+	require.NoError(t, err)
+
+	// drop the connection with the file still open
+	err = closeExpectingTransferError(t, client)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func TestChrootDiskFull(t *testing.T) {
+	// The request server sends write-only opens to Filewrite and read-write opens to OpenFile;
+	// both must refuse to start an upload on a nearly full disk.
+	for name, flags := range map[string]int{
+		"at write-only open": os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
+		"at read-write open": os.O_RDWR | os.O_CREATE | os.O_TRUNC,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, client := getChrootTupleWith(t, nil, func(c *chroot) {
+				c.freeSpace = func() uint64 { return 0 }
+			})
+			_, err := client.OpenFile("/upload", flags)
+			assert.ErrorContains(t, err, "no space left on device")
+			err = closeExpectingTransferError(t, client)
+			if assert.Error(t, err) {
+				assert.Contains(t, err.Error(), "Out of disk space")
+				assert.Contains(t, err.Error(), "/upload")
+			}
+		})
+	}
+
+	t.Run("concurrent writes", func(t *testing.T) {
+		var free atomic.Uint64
+		free.Store(2 << 30)
+		_, client := getChrootTupleWith(t, nil, func(c *chroot) {
+			c.freeSpace = free.Load
+		})
+
+		const writers = 8
+		files := make([]*File, writers)
+		for i := range files {
+			f, err := client.Create(fmt.Sprintf("/upload%d", i))
+			require.NoError(t, err)
+			files[i] = f
+		}
+
+		// the disk fills up while several uploads are writing at once;
+		// the request server runs these writes on parallel workers
+		free.Store(0)
+		var wg sync.WaitGroup
+		for _, f := range files {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := f.Write([]byte("data"))
+				assert.ErrorContains(t, err, "no space left on device")
+				assert.NoError(t, f.Close())
+			}()
+		}
+		wg.Wait()
+
+		err := closeExpectingTransferError(t, client)
+		if assert.Error(t, err) {
+			assert.Contains(t, err.Error(), "Out of disk space")
+		}
+	})
+}
+
+func TestChrootFailedWriteIsTransferError(t *testing.T) {
+	// /dev/full fails every write with ENOSPC
+	file, err := os.OpenFile("/dev/full", os.O_WRONLY, 0)
+	if err != nil {
+		t.Skip("no /dev/full:", err)
+	}
+	defer file.Close()
+
+	fs := &chroot{freeSpace: func() uint64 { return 2 << 30 }}
+	f := &CheckedFile{file: file, fs: fs}
+	_, err = f.WriteAt([]byte("data"), 0)
+	require.Error(t, err)
+	assert.Equal(t, err, fs.Err)
 }
